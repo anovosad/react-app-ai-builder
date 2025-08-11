@@ -207,6 +207,93 @@ func gatherContextJSON() (string, error) {
 	return string(jsonBytes), nil
 }
 
+// Extract file structure to show LLM the current project layout
+func extractFileStructure(filesJSON string) string {
+	var files []FileJSON
+	if err := json.Unmarshal([]byte(filesJSON), &files); err != nil {
+		return "Error reading project structure"
+	}
+
+	structure := "Current files in the project:\n"
+	for _, file := range files {
+		structure += fmt.Sprintf("- %s\n", file.Path)
+	}
+
+	structure += "\nDirectory structure:\n"
+	structure += "src/\n"
+	structure += "├── App.tsx\n"
+	structure += "├── main.tsx\n"
+	structure += "├── styles.css\n"
+	structure += "└── components/\n"
+	structure += "    └── SidePanel.tsx (DO NOT MODIFY)\n"
+
+	return structure
+}
+
+// Normalize and validate file paths to prevent incorrect nesting
+func normalizePath(path string) string {
+	// Remove any leading slashes or dots
+	path = strings.TrimPrefix(path, "/")
+	path = strings.TrimPrefix(path, "./")
+	path = strings.TrimPrefix(path, "../")
+
+	// Fix common path mistakes
+	// Fix double src directories (src/src/... -> src/...)
+	for strings.HasPrefix(path, "src/src/") {
+		path = strings.TrimPrefix(path, "src/")
+	}
+
+	// Fix frontend/src prefix (some models add this)
+	if strings.HasPrefix(path, "frontend/src/") {
+		path = strings.TrimPrefix(path, "frontend/")
+	}
+
+	// Fix project root references
+	if strings.HasPrefix(path, "ai-sidepanel-frontend/src/") {
+		path = strings.TrimPrefix(path, "ai-sidepanel-frontend/")
+	}
+
+	// Ensure path starts with src/ if it's a code file
+	if !strings.HasPrefix(path, "src/") &&
+		(strings.HasSuffix(path, ".tsx") ||
+			strings.HasSuffix(path, ".ts") ||
+			strings.HasSuffix(path, ".jsx") ||
+			strings.HasSuffix(path, ".js") ||
+			strings.HasSuffix(path, ".css")) {
+
+		// Special handling for components
+		if strings.Contains(path, "Component") ||
+			strings.Contains(path, "component") ||
+			(strings.HasSuffix(path, ".tsx") && !strings.Contains(path, "App") && !strings.Contains(path, "main")) {
+			path = "src/components/" + filepath.Base(path)
+		} else {
+			path = "src/" + path
+		}
+	}
+
+	// Normalize path separators
+	path = strings.ReplaceAll(path, "\\", "/")
+
+	// Remove any double slashes
+	for strings.Contains(path, "//") {
+		path = strings.ReplaceAll(path, "//", "/")
+	}
+
+	// Ensure components go in the components directory
+	if strings.HasPrefix(path, "src/") &&
+		strings.HasSuffix(path, ".tsx") &&
+		!strings.Contains(path, "App.tsx") &&
+		!strings.Contains(path, "main.tsx") &&
+		!strings.Contains(path, "SidePanel.tsx") &&
+		!strings.HasPrefix(path, "src/components/") {
+
+		filename := filepath.Base(path)
+		path = "src/components/" + filename
+	}
+
+	return path
+}
+
 // Builds strict JSON edit prompt
 func buildPrompt(instructions string, filesJSON string) string {
 	// Extract current file structure for the LLM
