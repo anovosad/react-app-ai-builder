@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from "react"
 import SidePanel from "./components/SidePanel"
-import Counter from "./components/Counter"
 
 export default function App(){
   const [darkMode, setDarkMode] = useState(true);
@@ -78,12 +77,9 @@ export default function App(){
             <li>"Create a contact form with validation"</li>
           </ul>
         </div>
-
-        <Counter />
       </div>
 
       {/* Side panel - always rendered last to ensure it's on top */}
       <SidePanel />
     </>
-  )
-}
+  )}

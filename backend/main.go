@@ -141,9 +141,15 @@ func handleEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Clean up the AI response before parsing
+	cleanedResponse := cleanAIResponse(aiResponse)
+
 	var edits AIEditActions
-	if err := json.Unmarshal([]byte(aiResponse), &edits); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to parse AI response as JSON: %v\nResponse: %s", err, aiResponse), http.StatusInternalServerError)
+	if err := json.Unmarshal([]byte(cleanedResponse), &edits); err != nil {
+		log.Printf("Failed to parse AI response as JSON: %v", err)
+		log.Printf("Original response: %s", aiResponse)
+		log.Printf("Cleaned response: %s", cleanedResponse)
+		http.Error(w, fmt.Sprintf("Failed to parse AI response as JSON: %v\nOriginal Response: %s", err, aiResponse), http.StatusInternalServerError)
 		return
 	}
 
@@ -203,7 +209,13 @@ func gatherContextJSON() (string, error) {
 
 // Builds strict JSON edit prompt
 func buildPrompt(instructions string, filesJSON string) string {
+	// Extract current file structure for the LLM
+	fileStructure := extractFileStructure(filesJSON)
+
 	return fmt.Sprintf(`You are a helpful AI programming assistant that edits a React + TypeScript project.
+
+CURRENT PROJECT STRUCTURE:
+%s
 
 Input files are provided as a JSON array of objects with these fields:
 [
@@ -212,24 +224,40 @@ Input files are provided as a JSON array of objects with these fields:
     "content": "<full file content here>"
   },
   {
-    "path": "src/components/SidePanel.tsx",
+    "path": "src/components/SidePanel.tsx", 
     "content": "<full file content here>"
   }
   ...
 ]
 
-Instructions:
+CRITICAL FILE PATH RULES:
+- NEVER create nested src directories (src/src/... is WRONG)
+- NEVER add project prefixes (frontend/src/... is WRONG) 
+- ALL file paths must be relative to the project root
+- Use EXACTLY these path patterns:
+  * For main files: "src/App.tsx", "src/main.tsx", "src/styles.css"
+  * For components: "src/components/ComponentName.tsx"
+  * For component styles: "src/components/ComponentName.css"
+- DO NOT add extra directories or change the existing structure
+- DO NOT modify the SidePanel.tsx file under any circumstances
+- When creating new React components, ALWAYS put them in "src/components/" directory
+- EXAMPLES OF CORRECT PATHS: "src/App.tsx", "src/components/Counter.tsx", "src/components/TodoList.tsx"
+- EXAMPLES OF WRONG PATHS: "src/src/App.tsx", "frontend/src/App.tsx", "components/Counter.tsx"
+
+IMPORTANT INSTRUCTIONS:
 - Follow the user instructions below precisely.
-- Return ONLY a JSON object describing an array of actions.
-- Do NOT modify the SidePanel.tsx file under any circumstances.
+- Return ONLY a valid JSON object describing an array of actions.
 - You are allowed to create, update, or delete files.
-- Do not return any other text, explanations, or comments outside the JSON.
+- Do not return any text, explanations, or comments outside the JSON.
 - Do not return any other JSON fields, only "actions".
 - Do not return thinking or reasoning steps.
+- Use proper JSON escaping for newlines and quotes.
+- Do NOT use HTML entities like \u003c or \u003e in your response.
+- Make sure your JSON is properly formatted and parseable.
 - Each action must be a valid JSON object.
 - Each action must have:
   - type: "create", "update", or "delete"
-  - path: a relative file path inside the project (e.g. "src/App.tsx")
+  - path: a relative file path following the rules above
   - content: full file content (required for create and update; omit for delete)
 
 Example output:
@@ -242,12 +270,8 @@ Example output:
       "content": "<new file content>"
     },
     {
-      "type": "delete",
-      "path": "src/oldFile.tsx"
-    },
-    {
-      "type": "create",
-      "path": "src/newComponent.tsx",
+      "type": "create", 
+      "path": "src/components/NewComponent.tsx",
       "content": "<file content>"
     }
   ]
@@ -258,7 +282,7 @@ User instructions:
 
 Project files (JSON array):
 %s
-`, instructions, filesJSON)
+`, fileStructure, instructions, filesJSON)
 }
 
 // Calls OpenRouter API
@@ -317,7 +341,7 @@ func callOpenRouter(prompt string, model string) (string, error) {
 		return "", fmt.Errorf("no choices in OpenRouter response")
 	}
 
-	return openRouterResp.Choices[0].Message.Content, nil
+	return cleanAIResponse(openRouterResp.Choices[0].Message.Content), nil
 }
 
 // Calls local Ollama API
@@ -361,7 +385,38 @@ func callOllama(prompt string, model string) (string, error) {
 		return "", fmt.Errorf("failed to parse Ollama response: %w", err)
 	}
 
-	return ollamaResp.Response, nil
+	return cleanAIResponse(ollamaResp.Response), nil
+}
+
+// Clean up AI response to fix common JSON parsing issues
+func cleanAIResponse(response string) string {
+	// Remove any text before the first {
+	startIndex := strings.Index(response, "{")
+	if startIndex > 0 {
+		response = response[startIndex:]
+	}
+
+	// Remove any text after the last }
+	lastIndex := strings.LastIndex(response, "}")
+	if lastIndex > 0 && lastIndex < len(response)-1 {
+		response = response[:lastIndex+1]
+	}
+
+	// Fix common HTML entity escapes that break JSON
+	response = strings.ReplaceAll(response, "\\u003c", "<")
+	response = strings.ReplaceAll(response, "\\u003e", ">")
+	response = strings.ReplaceAll(response, "\\u0026", "&")
+	response = strings.ReplaceAll(response, "\\u0027", "'")
+	response = strings.ReplaceAll(response, "\\u0022", "\"")
+
+	// Fix malformed escape sequences
+	response = strings.ReplaceAll(response, "\\un", "\\n")
+	response = strings.ReplaceAll(response, ");n}", ");}")
+
+	// Fix common malformed endings
+	response = strings.ReplaceAll(response, "\\n}", "}")
+
+	return response
 }
 
 // Applies the AI edits to local files
@@ -369,13 +424,28 @@ func applyEdits(edits AIEditActions) error {
 	log.Printf("Applying %d edit actions", len(edits.Actions))
 
 	for _, act := range edits.Actions {
+		// Normalize the path to prevent incorrect nesting
+		normalizedPath := normalizePath(act.Path)
+
+		// Log path changes for debugging
+		if normalizedPath != act.Path {
+			log.Printf("Normalized path: %s -> %s", act.Path, normalizedPath)
+		}
+
 		// Prevent editing the SidePanel
-		if strings.Contains(act.Path, "SidePanel") {
-			log.Printf("Skipping SidePanel modification: %s", act.Path)
+		if strings.Contains(normalizedPath, "SidePanel") {
+			log.Printf("Skipping SidePanel modification: %s", normalizedPath)
 			continue
 		}
 
-		fullPath := filepath.Join(projectRoot, act.Path)
+		// Validate that we're not creating files outside the project
+		if strings.Contains(normalizedPath, "..") || strings.HasPrefix(normalizedPath, "/") {
+			log.Printf("Skipping potentially dangerous path: %s", normalizedPath)
+			continue
+		}
+
+		// Build full path for file operations
+		fullPath := filepath.Join(projectRoot, strings.TrimPrefix(normalizedPath, "src/"))
 
 		switch act.Type {
 		case "create", "update":
@@ -385,12 +455,12 @@ func applyEdits(edits AIEditActions) error {
 			if err := ioutil.WriteFile(fullPath, []byte(act.Content), 0644); err != nil {
 				return err
 			}
-			log.Printf("%s file: %s", strings.Title(act.Type), fullPath)
+			log.Printf("%s file: %s (normalized from: %s)", strings.Title(act.Type), fullPath, act.Path)
 		case "delete":
 			if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
 				return err
 			}
-			log.Printf("Deleted file: %s", fullPath)
+			log.Printf("Deleted file: %s (normalized from: %s)", fullPath, act.Path)
 		default:
 			log.Printf("Unknown action type: %s", act.Type)
 		}
