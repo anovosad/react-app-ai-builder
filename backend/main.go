@@ -4,24 +4,40 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"io/fs"
 	"io/ioutil"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/joho/godotenv"
 )
 
 const projectRoot = "../frontend/src" // Path to your React project folder
 
-// Ollama's direct API response
+// Request from frontend
+type EditRequest struct {
+	Instructions string `json:"instructions"`
+	Provider     string `json:"provider"` // "openrouter" or "ollama"
+	Model        string `json:"model"`
+}
+
+// OpenRouter API response
+type OpenRouterResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
+}
+
+// Ollama API response
 type OllamaResponse struct {
 	Model     string `json:"model"`
 	CreatedAt string `json:"created_at"`
-	Response  string `json:"response"` // JSON string with edit actions
+	Response  string `json:"response"`
 	Done      bool   `json:"done"`
 }
 
@@ -40,7 +56,45 @@ type FileJSON struct {
 }
 
 func main() {
-	http.HandleFunc("/api/edit", handleEdit)
+	// Enable CORS
+	http.HandleFunc("/api/edit", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		handleEdit(w, r)
+	})
+
+	// Add models endpoint
+	http.HandleFunc("/api/models", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "application/json")
+
+		models := map[string][]string{
+			"openrouter": {
+				"anthropic/claude-3.5-sonnet",
+				"openai/gpt-4o",
+				"openai/gpt-4o-mini",
+				"google/gemini-pro-1.5",
+				"meta-llama/llama-3.1-8b-instruct:free",
+				"qwen/qwen-2.5-72b-instruct",
+			},
+			"ollama": {
+				"llama3.2",
+				"qwen2.5",
+				"codellama",
+				"deepseek-coder",
+				"starcoder2",
+			},
+		}
+
+		json.NewEncoder(w).Encode(models)
+	})
 
 	fmt.Println("Backend running at http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
@@ -53,9 +107,7 @@ func handleEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Instructions string `json:"instructions"`
-	}
+	var req EditRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -69,19 +121,42 @@ func handleEdit(w http.ResponseWriter, r *http.Request) {
 
 	prompt := buildPrompt(req.Instructions, contextJSON)
 
-	ollamaResp, err := callOllama(prompt)
-	if err != nil {
+	var aiResponse string
+	var parseErr error
+
+	switch req.Provider {
+	case "openrouter":
+		aiResponse, parseErr = callOpenRouter(prompt, req.Model)
+	case "ollama":
+		aiResponse, parseErr = callOllama(prompt, req.Model)
+	default:
+		http.Error(w, "Invalid provider. Use 'openrouter' or 'ollama'", http.StatusBadRequest)
+		return
+	}
+
+	if parseErr != nil {
+		http.Error(w, parseErr.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var edits AIEditActions
+	if err := json.Unmarshal([]byte(aiResponse), &edits); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to parse AI response as JSON: %v\nResponse: %s", err, aiResponse), http.StatusInternalServerError)
+		return
+	}
+
+	if err := applyEdits(edits); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	if err := applyEdits(ollamaResp); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	response := map[string]interface{}{
+		"status":  "success",
+		"applied": len(edits.Actions),
 	}
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"success"}`))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // Reads project files into JSON array
@@ -144,9 +219,9 @@ Input files are provided as a JSON array of objects with these fields:
 Instructions:
 - Follow the user instructions below precisely.
 - Return ONLY a JSON object describing an array of actions.
-- Do not modify the SidePanel.tsx file at all.
+- Do NOT modify the SidePanel.tsx file under any circumstances.
 - You are allowed to create, update, or delete files.
-- Do not return any other text, explanations, or comments.
+- Do not return any other text, explanations, or comments outside the JSON.
 - Do not return any other JSON fields, only "actions".
 - Do not return thinking or reasoning steps.
 - Each action must be a valid JSON object.
@@ -184,11 +259,16 @@ Project files (JSON array):
 `, instructions, filesJSON)
 }
 
-// Calls Ollama API
-func callOllama(prompt string) (AIEditActions, error) {
-	reqBody := map[string]any{
-		"model": "qwen/qwen3-30b-a3b:free",
-		"steam": false,
+// Calls OpenRouter API
+func callOpenRouter(prompt string, model string) (string, error) {
+	godotenv.Load() // Load environment variables from .env file
+	apiKey := os.Getenv("OPENROUTER_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("OPENROUTER_API_KEY environment variable is not set")
+	}
+
+	reqBody := map[string]interface{}{
+		"model": model,
 		"messages": []map[string]string{
 			{
 				"role":    "user",
@@ -197,115 +277,103 @@ func callOllama(prompt string) (AIEditActions, error) {
 		},
 	}
 
-	buf := new(bytes.Buffer)
-	if err := json.NewEncoder(buf).Encode(reqBody); err != nil {
-		return AIEditActions{}, err
-	}
-
-	fmt.Println("Sending request to Ollama with prompt length:", len(prompt))
-	fmt.Println("Request body:", buf.String())
-
-	// Make the HTTP request to Ollama API
-	fmt.Println("Making HTTP POST request to Ollama API...")
-
-	// read the API key from environment variable
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		return AIEditActions{}, fmt.Errorf("OPENROUTER_API_KEY environment variable is not set")
-	}
-
-	req := &http.Request{
-		Method: "POST",
-		URL:    &url.URL{Scheme: "https", Host: "openrouter.ai", Path: "/api/v1/chat/completions"},
-		Header: http.Header{
-			"Content-Type":  {"application/json"},
-			"Authorization": {"Bearer " + apiKey},
-		},
-	}
-
-	req.Body = io.NopCloser(buf)
-	fmt.Println("Sending request to Ollama API...")
-
-	resp, err := http.DefaultClient.Do(req)
+	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return AIEditActions{}, err
+		return "", err
+	}
+
+	req, err := http.NewRequest("POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	bodyString := new(bytes.Buffer)
-	if _, err := bodyString.ReadFrom(resp.Body); err != nil {
-		return AIEditActions{}, err
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
 	}
 
-	// unmarshal the response
-	var ollamaResp map[string]any
-	if err := json.Unmarshal(bodyString.Bytes(), &ollamaResp); err != nil {
-		return AIEditActions{}, fmt.Errorf("failed to parse Ollama response: %w", err)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("OpenRouter API error %d: %s", resp.StatusCode, string(body))
 	}
 
-	// ollamaResp["choices"]["0"]["message"]["content"]
-	if _, ok := ollamaResp["choices"]; !ok {
-		return AIEditActions{}, fmt.Errorf("unexpected Ollama response format: %v", ollamaResp)
+	var openRouterResp OpenRouterResponse
+	if err := json.Unmarshal(body, &openRouterResp); err != nil {
+		return "", fmt.Errorf("failed to parse OpenRouter response: %w", err)
 	}
 
-	choices, ok := ollamaResp["choices"].([]interface{})
-	if !ok || len(choices) == 0 {
-		return AIEditActions{}, fmt.Errorf("no choices found in Ollama response")
+	if len(openRouterResp.Choices) == 0 {
+		return "", fmt.Errorf("no choices in OpenRouter response")
 	}
 
-	message, ok := choices[0].(map[string]interface{})
-	if !ok {
-		return AIEditActions{}, fmt.Errorf("unexpected choice format: %v", choices[0])
+	return openRouterResp.Choices[0].Message.Content, nil
+}
+
+// Calls local Ollama API
+func callOllama(prompt string, model string) (string, error) {
+	reqBody := map[string]interface{}{
+		"model":  model,
+		"prompt": prompt,
+		"stream": false,
 	}
 
-	content, ok := message["message"].(map[string]interface{})["content"].(string)
-	if !ok {
-		return AIEditActions{}, fmt.Errorf("unexpected message format: %v", message)
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
 	}
 
-	var edits AIEditActions
-	if err := json.Unmarshal([]byte(content), &edits); err != nil {
-		return AIEditActions{}, fmt.Errorf("failed to parse AI edits: %w", err)
+	req, err := http.NewRequest("POST", "http://localhost:11434/api/generate", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", err
 	}
 
-	// Log the AI's suggested actions
-	log.Printf("AI suggested %d actions:\n", len(edits.Actions))
-	// Print the actions in a readable format
+	req.Header.Set("Content-Type", "application/json")
 
-	fmt.Printf("AI suggested %d actions:\n", len(edits.Actions))
-	for _, act := range edits.Actions {
-		fmt.Printf("- %s: %s\n", act.Type, act.Path)
-		if act.Type == "create" || act.Type == "update" {
-			fmt.Printf("  Content length: %d\n", len(act.Content))
-		}
-		if act.Type == "delete" {
-			fmt.Printf("  Will delete file: %s\n", act.Path)
-		}
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to connect to Ollama (make sure it's running on localhost:11434): %w", err)
 	}
-	if len(edits.Actions) == 0 {
-		log.Println("AI returned no actions, nothing to apply.")
-		return AIEditActions{}, fmt.Errorf("no actions returned by AI")
-	}
-	if len(edits.Actions) > 100 {
-		log.Println("AI returned too many actions, limiting to 100")
-		edits.Actions = edits.Actions[:100] // Limit to 100 actions
-		fmt.Println("Limited actions to 100 due to API constraints.")
-	} else if len(edits.Actions) > 50 {
-		log.Println("AI returned a large number of actions, consider reviewing them carefully")
-		fmt.Println("AI returned a large number of actions, consider reviewing them carefully")
-	}
-	if len(edits.Actions) == 0 {
-		log.Println("AI returned no actions, nothing to apply.")
-		return AIEditActions{}, fmt.Errorf("no actions returned by AI")
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
 	}
 
-	return edits, nil
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Ollama API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var ollamaResp OllamaResponse
+	if err := json.Unmarshal(body, &ollamaResp); err != nil {
+		return "", fmt.Errorf("failed to parse Ollama response: %w", err)
+	}
+
+	return ollamaResp.Response, nil
 }
 
 // Applies the AI edits to local files
 func applyEdits(edits AIEditActions) error {
+	log.Printf("Applying %d edit actions", len(edits.Actions))
+
 	for _, act := range edits.Actions {
-		fullPath := filepath.Join(projectRoot, "..", act.Path)
+		// Prevent editing the SidePanel
+		if strings.Contains(act.Path, "SidePanel") {
+			log.Printf("Skipping SidePanel modification: %s", act.Path)
+			continue
+		}
+
+		fullPath := filepath.Join(projectRoot, act.Path)
 
 		switch act.Type {
 		case "create", "update":
@@ -315,14 +383,14 @@ func applyEdits(edits AIEditActions) error {
 			if err := ioutil.WriteFile(fullPath, []byte(act.Content), 0644); err != nil {
 				return err
 			}
-			log.Printf("%s file: %s\n", strings.Title(act.Type), fullPath)
+			log.Printf("%s file: %s", strings.Title(act.Type), fullPath)
 		case "delete":
 			if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
 				return err
 			}
-			log.Printf("Deleted file: %s\n", fullPath)
+			log.Printf("Deleted file: %s", fullPath)
 		default:
-			log.Printf("Unknown action type: %s\n", act.Type)
+			log.Printf("Unknown action type: %s", act.Type)
 		}
 	}
 	return nil
