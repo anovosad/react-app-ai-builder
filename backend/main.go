@@ -77,11 +77,13 @@ func main() {
 
 		models := map[string][]string{
 			"openrouter": {
+				"qwen/qwen-2.5-7b-instruct:free",
+				"qwen/qwen3-30b-a3b:free",
+				"meta-llama/llama-3.1-8b-instruct:free",
 				"anthropic/claude-3.5-sonnet",
 				"openai/gpt-4o",
 				"openai/gpt-4o-mini",
 				"google/gemini-pro-1.5",
-				"meta-llama/llama-3.1-8b-instruct:free",
 				"qwen/qwen-2.5-72b-instruct",
 			},
 			"ollama": {
